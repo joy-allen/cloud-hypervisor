@@ -618,6 +618,19 @@ impl ApplyLandlock for GenericVhostUserConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PmemBackendType {
+    File,
+    Uffd,
+}
+
+impl Default for PmemBackendType {
+    fn default() -> Self {
+        Self::File
+    }
+}
+
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PmemConfig {
@@ -625,14 +638,24 @@ pub struct PmemConfig {
     pub pci_common: PciDeviceCommonConfig,
     pub file: PathBuf,
     #[serde(default)]
+    pub backend_type: PmemBackendType,
+    #[serde(default)]
     pub size: Option<u64>,
+    #[serde(default)]
+    pub readonly: bool,
     #[serde(default)]
     pub discard_writes: bool,
 }
 
 impl ApplyLandlock for PmemConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
-        let access = if self.discard_writes { "r" } else { "rw" };
+        let access = if self.backend_type == PmemBackendType::File
+            && (self.readonly || self.discard_writes)
+        {
+            "r"
+        } else {
+            "rw"
+        };
         landlock.add_rule_with_access(&self.file, access)?;
         Ok(())
     }
