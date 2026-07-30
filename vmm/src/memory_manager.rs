@@ -27,6 +27,10 @@ use devices::ioapic;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use hypervisor::HypervisorVmError;
 use log::{debug, error, info, warn};
+use ondemand_block::{
+    HANDSHAKE_FLAG_ACK_REQUIRED, HANDSHAKE_FLAG_BACKING_FDS, HANDSHAKE_FLAG_MANAGED,
+    UFFD_MODE_MISSING, UFFD_MODE_WP, UFFD_MODE_WP_ASYNC, VmaRegion,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracer::trace_scoped;
@@ -59,8 +63,8 @@ use crate::migration::transport::SocketStream;
 use crate::migration::url_to_path;
 use crate::sparse::{next_data_extent, write_region_sparse};
 use crate::uffd::{
-    self, FaultResolution, FileUffdMemorySource, SocketUffdMemorySource, UffdMemorySource,
-    UffdRange,
+    self, ExternalUffdConfig, ExternalUffdHandler, FaultResolution, FileUffdMemorySource,
+    SocketUffdMemorySource, UffdMemorySource, UffdRange,
 };
 use crate::vm_config::{HotplugMethod, MemoryConfig, MemoryZoneConfig};
 use crate::{GuestMemoryMmap, GuestRegionMmap, MEMORY_MANAGER_SNAPSHOT_ID, userfaultfd};
@@ -71,6 +75,14 @@ struct UffdHandler {
     handle: thread::JoinHandle<()>,
     fault_socket_fd: Option<OwnedFd>,
     prefault_complete: Arc<AtomicBool>,
+}
+
+struct ExternalRamUffd {
+    // Drop the protocol connection before the VMM's duplicate UFFD.
+    handler: ExternalUffdHandler,
+    uffd: OwnedFd,
+    register_mode: u64,
+    page_size: u64,
 }
 
 pub const MEMORY_MANAGER_ACPI_SIZE: usize = 0x18;
@@ -237,6 +249,7 @@ pub struct MemoryManager {
     // slots that the mapping is created in.
     guest_ram_mappings: Vec<GuestRamMapping>,
     uffd_handler: Option<UffdHandler>,
+    external_uffd: Option<ExternalRamUffd>,
 
     pub acpi_address: Option<GuestAddress>,
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -419,6 +432,14 @@ pub enum Error {
     /// Failed to prefault memory
     #[error("Failed to prefault memory")]
     PrefaultMemory(#[source] io::Error),
+
+    /// Failed to use an external UFFD backend
+    #[error("Failed to use an external UFFD backend")]
+    ExternalUffd(#[source] io::Error),
+
+    /// Guest RAM is not backed by a file
+    #[error("Guest RAM region at {0:#x} is not backed by a file")]
+    ExternalUffdBackingMissing(u64),
 }
 
 impl From<UffdError> for Error {
@@ -1028,12 +1049,16 @@ impl MemoryManager {
                     source: e,
                 })? as u64;
 
-            let ioctls = uffd::register(uffd_fd.as_fd(), host_addr, range.length).map_err(|e| {
-                UffdError::Register {
-                    addr: host_addr,
-                    len: range.length,
-                    source: e,
-                }
+            let ioctls = uffd::register(
+                uffd_fd.as_fd(),
+                host_addr,
+                range.length,
+                userfaultfd::UFFDIO_REGISTER_MODE_MISSING,
+            )
+            .map_err(|e| UffdError::Register {
+                addr: host_addr,
+                len: range.length,
+                source: e,
             })?;
 
             if ioctls & userfaultfd::UFFD_API_RANGE_IOCTLS_BASIC
@@ -1143,6 +1168,127 @@ impl MemoryManager {
             features |= userfaultfd::UFFD_FEATURE_MISSING_HUGETLBFS;
         }
         features
+    }
+
+    /// Attach the current guest RAM to a managed external UFFD backend.
+    ///
+    /// This is the core entry point for the Guest RAM reclamation prototype.
+    /// Configuration and API plumbing are intentionally left to the eventual
+    /// integration.
+    #[allow(dead_code)]
+    pub(crate) fn attach_external_uffd(
+        &mut self,
+        socket_path: &Path,
+        register_mode: u64,
+        features: u64,
+    ) -> Result<(), Error> {
+        if self.external_uffd.is_some() || self.uffd_handler.is_some() {
+            return Err(Error::ExternalUffd(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "A UFFD backend is already attached",
+            )));
+        }
+
+        let uffd_modes = Self::external_uffd_modes(register_mode, features);
+
+        // SAFETY: sysconf has no memory-safety preconditions.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let uffd = uffd::create(features).map_err(Error::ExternalUffd)?;
+        let guest_memory = self.guest_memory.memory();
+        let mut regions = Vec::new();
+        let mut backing_fds = Vec::new();
+
+        for region in guest_memory.iter() {
+            let (vma, backing_fd) = Self::external_uffd_region(region, page_size)?;
+            uffd::register(uffd.as_fd(), vma.virt_addr, vma.size, register_mode)
+                .map_err(Error::ExternalUffd)?;
+            regions.push(vma);
+            backing_fds.push(backing_fd);
+        }
+
+        let config = ExternalUffdConfig {
+            socket_path: socket_path.to_path_buf(),
+            uffd: uffd.try_clone().map_err(Error::ExternalUffd)?,
+            regions,
+            handshake_flags: HANDSHAKE_FLAG_MANAGED
+                | HANDSHAKE_FLAG_ACK_REQUIRED
+                | HANDSHAKE_FLAG_BACKING_FDS,
+            uffd_modes,
+            backing_fds,
+        };
+        let handler =
+            ExternalUffdHandler::new("guest-ram", config, None).map_err(Error::ExternalUffd)?;
+        self.external_uffd = Some(ExternalRamUffd {
+            handler,
+            uffd,
+            register_mode,
+            page_size,
+        });
+
+        Ok(())
+    }
+
+    fn external_uffd_modes(register_mode: u64, features: u64) -> u8 {
+        let mut modes = 0;
+        if register_mode & userfaultfd::UFFDIO_REGISTER_MODE_MISSING != 0 {
+            modes |= UFFD_MODE_MISSING;
+        }
+        if register_mode & userfaultfd::UFFDIO_REGISTER_MODE_WP != 0 {
+            modes |= UFFD_MODE_WP;
+        }
+        if features & userfaultfd::UFFD_FEATURE_WP_ASYNC != 0 {
+            modes |= UFFD_MODE_WP_ASYNC;
+        }
+        modes
+    }
+
+    fn external_uffd_region(
+        region: &GuestRegionMmap,
+        page_size: u64,
+    ) -> Result<(VmaRegion, OwnedFd), Error> {
+        let gpa = region.start_addr().raw_value();
+        let file_offset = region
+            .file_offset()
+            .ok_or(Error::ExternalUffdBackingMissing(gpa))?;
+        let backing_fd = file_offset
+            .file()
+            .try_clone()
+            .map(OwnedFd::from)
+            .map_err(Error::ExternalUffd)?;
+
+        Ok((
+            VmaRegion {
+                virt_addr: region.as_ptr() as u64,
+                size: region.len(),
+                // GPA is a stable, VMM-defined key for the flattened guest
+                // address space; backing_offset identifies the same bytes in
+                // the accompanying file descriptor.
+                offset: gpa,
+                fault_size: page_size,
+                prot: region.prot(),
+                flags: region.flags(),
+                backing_offset: file_offset.start(),
+            },
+            backing_fd,
+        ))
+    }
+
+    fn add_external_uffd_region(&mut self, region: &GuestRegionMmap) -> Result<(), Error> {
+        let Some(state) = self.external_uffd.as_mut() else {
+            return Ok(());
+        };
+        let (vma, backing_fd) = Self::external_uffd_region(region, state.page_size)?;
+        uffd::register(
+            state.uffd.as_fd(),
+            vma.virt_addr,
+            vma.size,
+            state.register_mode,
+        )
+        .map_err(Error::ExternalUffd)?;
+        state
+            .handler
+            .add_region(vma, Some(backing_fd.as_raw_fd()))
+            .map_err(Error::ExternalUffd)
     }
 
     fn stop_uffd_handler(&mut self) {
@@ -1875,6 +2021,7 @@ impl MemoryManager {
             memory_zones,
             guest_ram_mappings: Vec::new(),
             uffd_handler: None,
+            external_uffd: None,
             acpi_address,
             log_dirty: dynamic, // Cannot log dirty pages on a TD
             arch_mem_regions,
@@ -2373,6 +2520,7 @@ impl MemoryManager {
         }
 
         let region = self.add_ram_region(start_addr, size)?;
+        self.add_external_uffd_region(&region)?;
 
         // Add region to the list of regions associated with the default
         // memory zone.
@@ -3223,6 +3371,7 @@ impl Pausable for MemoryManager {}
 
 impl Drop for MemoryManager {
     fn drop(&mut self) {
+        self.external_uffd.take();
         self.stop_uffd_handler();
     }
 }

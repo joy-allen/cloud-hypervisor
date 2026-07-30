@@ -3509,8 +3509,13 @@ impl DeviceManager {
         };
         let runtime = if pmem_cfg.backend_type == PmemBackendType::Uffd {
             let uffd_fd = uffd::create(0).map_err(DeviceManagerError::PmemUffdCreate)?;
-            let ioctls = uffd::register(uffd_fd.as_fd(), host_addr as u64, region_size)
-                .map_err(DeviceManagerError::PmemUffdCreate)?;
+            let ioctls = uffd::register(
+                uffd_fd.as_fd(),
+                host_addr as u64,
+                region_size,
+                userfaultfd::UFFDIO_REGISTER_MODE_MISSING,
+            )
+            .map_err(DeviceManagerError::PmemUffdCreate)?;
             if ioctls & userfaultfd::UFFD_API_RANGE_IOCTLS_BASIC
                 != userfaultfd::UFFD_API_RANGE_IOCTLS_BASIC
             {

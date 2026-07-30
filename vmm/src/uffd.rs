@@ -139,12 +139,12 @@ pub(crate) fn create(required_features: u64) -> Result<OwnedFd, Error> {
     Ok(fd)
 }
 
-/// Register a memory range for missing-page fault handling.
-pub(crate) fn register(fd: BorrowedFd<'_>, addr: u64, len: u64) -> Result<u64, Error> {
+/// Register a memory range for userfaultfd handling.
+pub(crate) fn register(fd: BorrowedFd<'_>, addr: u64, len: u64, mode: u64) -> Result<u64, Error> {
     let mut reg = UffdioRegister {
         range_start: addr,
         range_len: len,
-        mode: userfaultfd::UFFDIO_REGISTER_MODE_MISSING,
+        mode,
         ioctls: 0,
     };
     // SAFETY: `reg` is a valid, correctly-sized struct for this ioctl.
@@ -439,7 +439,6 @@ impl ExternalUffdHandler {
     }
 
     /// Add or update a region in a managed external UFFD session.
-    #[allow(dead_code)]
     pub(crate) fn add_region(
         &mut self,
         region: VmaRegion,
